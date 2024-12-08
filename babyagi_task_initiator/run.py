@@ -1,66 +1,106 @@
+#!/usr/bin/env python
+from dotenv import load_dotenv
+from babyagi_task_initiator.schemas import (
+    InputSchema, 
+    TaskList, 
+    Task, 
+    TaskInitiatorPromptSchema, 
+    TaskInitiatorAgentConfig
+)
+from naptha_sdk.schemas import AgentDeployment, AgentRunInput
+from naptha_sdk.utils import get_logger
+import json
 import os
-import yaml
 import instructor
-from litellm import Router
-from babyagi_task_initiator.schemas import InputSchema, TaskList
-from babyagi_task_initiator.utils import get_logger
+from litellm import completion
 
-
+load_dotenv()
 logger = get_logger(__name__)
 
-client = instructor.patch(
-    Router(
-        model_list=
-        [
-            {
-                "model_name": "gpt-3.5-turbo",
-                "litellm_params": {
-                    "model": "openai/gpt-3.5-turbo",
-                    "api_key": os.getenv("OPENAI_API_KEY"),
-                },
-            }
-        ],
-        # default_litellm_params={"acompletion": True},
-    )
-)
-
-def llm_call(messages, response_model=None):
-    if response_model:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            response_model=response_model,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=1000,
+class TaskInitiatorAgent:
+    def __init__(self, agent_deployment: AgentDeployment):
+        self.agent_deployment = agent_deployment
+        
+        # Ensure agent_config is the correct type
+        if isinstance(self.agent_deployment.agent_config, dict):
+            self.agent_deployment.agent_config = TaskInitiatorAgentConfig(**self.agent_deployment.agent_config)
+        
+        # Set up the instructor-patched client
+        self.client = instructor.patch(
+            completion,
+            mode=instructor.Mode.JSON
         )
-    return response
 
-def run(inputs: InputSchema, *args, **kwargs):
-    logger.info(f"Running with inputs {inputs.objective}")
-    cfg = kwargs["cfg"]
+    def generate_tasks(self, inputs: InputSchema) -> str:
+        # Prepare user prompt
+        user_prompt = self.agent_deployment.agent_config.user_message_template.replace(
+            "{{objective}}", 
+            inputs.tool_input_data.objective
+        )
+        
+        # Prepare context if available
+        context = inputs.tool_input_data.context
+        if context:
+            user_prompt += f"\nContext: {context}"
+        
+        # Prepare messages
+        messages = [
+            {"role": "system", "content": json.dumps(self.agent_deployment.agent_config.system_prompt)},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        # Prepare LLM configuration
+        llm_config = self.agent_deployment.agent_config.llm_config
+        api_key = None if llm_config.client == "ollama" else ("EMPTY" if llm_config.client == "vllm" else os.getenv("OPENAI_API_KEY"))
+        
+        # Make LLM call
+        response = completion(
+            model=self.agent_deployment.agent_config.llm_config.model,
+            messages=messages,
+            temperature=self.agent_deployment.agent_config.llm_config.temperature,
+            max_tokens=self.agent_deployment.agent_config.llm_config.max_tokens,
+            api_base=self.agent_deployment.agent_config.llm_config.api_base,
+            api_key=api_key
+        )
+        
+        logger.info(f"Generated Tasks: {response}")
+        return response.model_dump_json()
 
-    user_prompt = cfg["inputs"]["user_message_template"].replace("{{objective}}", inputs.objective)
-
-    messages = [
-        {"role": "system", "content": cfg["inputs"]["system_message"]},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    response = llm_call(messages, response_model=TaskList)
-
-    logger.info(f"Result: {response}")
-
-    return response.model_dump_json()
-
+def run(agent_run: AgentRunInput, *args, **kwargs):
+    logger.info(f"Running with inputs {agent_run.inputs.tool_input_data}")
+    task_initiator_agent = TaskInitiatorAgent(agent_run.agent_deployment)
+    method = getattr(task_initiator_agent, agent_run.inputs.tool_name, None)
+    return method(agent_run.inputs)
 
 if __name__ == "__main__":
-    with open("babyagi_task_initiator/component.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-
-    inputs = InputSchema(
-        objective="Write a blog post about the weather in London."
+    from naptha_sdk.client.naptha import Naptha
+    from naptha_sdk.configs import load_agent_deployments
+    
+    naptha = Naptha()
+    
+    # Load agent deployments
+    agent_deployments = load_agent_deployments(
+        "babyagi_task_initiator/configs/agent_deployments.json", 
+        load_persona_data=False, 
+        load_persona_schema=False
     )
-
-    r = run(inputs, cfg=cfg)
-    logger.info(f"Result: {type(r)}")
-
+    
+    # Prepare input parameters
+    input_params = InputSchema(
+        tool_name="generate_tasks",
+        tool_input_data=TaskInitiatorPromptSchema(
+            objective="Write a blog post about the weather in London.",
+            context="Focus on historical weather patterns between 1900 and 2000"
+        )
+    )
+    
+    # Create agent run input
+    agent_run = AgentRunInput(
+        inputs=input_params,
+        agent_deployment=agent_deployments[0],
+        consumer_id=naptha.user.id,
+    )
+    
+    # Run the agent
+    response = run(agent_run)
+    logger.info(f"Final Response: {response}")
